@@ -1,0 +1,5 @@
+discord.py==2.3.2
+wavelink==2.6.3
+yt-dlp
+Flask==3.0.3
+lyricsgenius==3.0.1
