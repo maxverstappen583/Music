@@ -11,7 +11,7 @@ services:
       - ./application.yml:/opt/Lavalink/application.yml
     environment:
       - SERVER_PORT=2333
-      - LAVALINK_SERVER_PASSWORD=youshallnotpass
+      - LAVALINK_SERVER_PASSWORD=maxverstappentututu
 
   bot:
     build: .
