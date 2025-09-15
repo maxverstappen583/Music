@@ -1,17 +1,15 @@
 """
 musicbot_247_flask.py
 
-Features:
-- Discord music bot (discord.py + wavelink)
-- YouTube search (prefix) and URL play (slash)
-- Spotify support if Lavalink/Wavelink Spotify is configured
-- Queue, loop, shuffle, skip, pause/resume, stop, volume
-- Now Playing embed with blue control buttons, album art, metadata
-- Genius lyrics (optional; set GENIUS_TOKEN)
-- "EARRAPE" gated double-confirm modal (temporary high volume + auto-restore)
+Single-file modern music bot with:
+- Prefix + slash commands
+- Play (YouTube search / link), queue, loop, shuffle, skip, pause/resume, stop, volume
+- Now Playing embed with blue control buttons + Lyrics via Genius (optional)
+- EARRAPE gated double-confirm modal (temporary blast + auto-restore)
 - 24/7 per-guild toggle (persisted to settings.json)
-- Flask webserver to keep process alive for hosting services (runs in separate thread)
-- Config via environment variables
+- Flask keepalive for Render (runs on separate thread)
+- Lavalink (wavelink) connection
+- JOIN and LEAVE commands available as both prefix (?join/?leave) and slash (/join /leave)
 """
 
 import os
@@ -28,18 +26,19 @@ from flask import Flask, jsonify
 # ----------------------------
 # Configuration (from env)
 # ----------------------------
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_DISCORD_BOT_TOKEN")
-GENIUS_TOKEN = os.getenv("GENIUS_TOKEN", "")  # optional
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN") or "YOUR_DISCORD_BOT_TOKEN"
+# Accept either name for genius in env
+GENIUS_TOKEN = os.getenv("GENIUS_TOKEN") or os.getenv("GENIUS_API_TOKEN") or ""
 LAVALINK_HOST = os.getenv("LAVALINK_HOST", "localhost")
 LAVALINK_PORT = int(os.getenv("LAVALINK_PORT", "2333"))
-LAVALINK_PASSWORD = os.getenv("LAVALINK_PASS", "youshallnotpass")
+LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", os.getenv("LAVALINK_PASS", "youshallnotpass"))
 PREFIX = os.getenv("BOT_PREFIX", "?")
-FLASK_PORT = int(os.getenv("PORT", "8080"))
+FLASK_PORT = int(os.getenv("FLASK_PORT", os.getenv("PORT", "8080")))
 
 # EARRAPE safety constants
 EARRAPE_DEFAULT_SECONDS = 8
 EARRAPE_MAX_SECONDS = 30
-EARRAPE_VOLUME = 400  # target volume for earrape; node may clamp
+EARRAPE_VOLUME = 400  # target (may be clamped by Lavalink/node)
 
 SETTINGS_FILE = "settings.json"
 
@@ -167,7 +166,6 @@ async def connect_player_for(ctx_or_inter):
 # Auto-disconnect helper (2 minutes if not 24/7)
 # ----------------------------
 async def schedule_auto_disconnect(player: wavelink.Player, guild_id: int, delay: int = 120):
-    # cancel existing
     try:
         if getattr(player, "_disconnect_task", None):
             player._disconnect_task.cancel()
@@ -177,19 +175,14 @@ async def schedule_auto_disconnect(player: wavelink.Player, guild_id: int, delay
     async def _task():
         try:
             await asyncio.sleep(delay)
-            # check state again
             if player.is_playing() or not player.is_connected():
                 return
-            # if 24/7 enabled -> don't disconnect
             if is_247_enabled(guild_id):
                 return
-            # final check: queue non-empty or playing?
             if getattr(player, "queue", None) and not player.queue.is_empty:
                 return
-            # disconnect
             try:
                 await player.disconnect()
-                # if we can announce, try to
                 ch = getattr(player, "text_channel", None)
                 if ch:
                     await ch.send("⏹️ Inactive for 2 minutes — disconnected.")
@@ -235,7 +228,6 @@ class EarrapeConfirmModal(discord.ui.Modal, title="EARRAPE CONFIRMATION (DANGERO
 
         prev_volume = getattr(self.player, "custom_volume", 100)
         ear_vol = min(EARRAPE_VOLUME, 1000)
-        # attempt to set earrape volume (best-effort)
         try:
             await self.player.set_volume(ear_vol)
         except Exception:
@@ -281,7 +273,6 @@ class MusicControls(discord.ui.View):
         self.requester_id = requester_id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # allow all interactions; some buttons check requester id
         return True
 
     @discord.ui.button(label="⏯ Pause/Resume", style=discord.ButtonStyle.primary, row=0)
@@ -409,7 +400,7 @@ async def cmd_play(ctx, *, query: str):
         return
 
     added = 0
-    for tr in (tracks if isinstance(tr, list) else [tracks]):
+    for tr in (tracks if isinstance(tracks, list) else [tracks]):
         try:
             tr.requester = ctx.author
         except Exception:
@@ -426,17 +417,14 @@ async def cmd_play(ctx, *, query: str):
 # ----------------------------
 # Slash play (requires link)
 # ----------------------------
-@bot.tree.command(name="play", description="Play from a YouTube or Spotify link (provide link).")
-@discord.app_commands.describe(url="YouTube or Spotify link")
+@bot.tree.command(name="play", description="Play from a YouTube link (provide link or playlist).")
+@discord.app_commands.describe(url="YouTube link or playlist")
 async def slash_play(interaction: discord.Interaction, url: str):
     player = await connect_player_for(interaction)
     if not player:
         return
     try:
-        if "spotify" in url and hasattr(wavelink, "SpotifyTrack"):
-            tracks = await wavelink.SpotifyTrack.search(query=url)
-        else:
-            tracks = await wavelink.YouTubeTrack.search(query=url)
+        tracks = await wavelink.YouTubeTrack.search(query=url)
     except Exception:
         await interaction.response.send_message("⚠️ Error searching. Ensure Lavalink is running.", ephemeral=True)
         return
@@ -461,34 +449,63 @@ async def slash_play(interaction: discord.Interaction, url: str):
         await send_now_playing(player, interaction.user)
 
 # ----------------------------
-# send Now Playing embed + controls
+# JOIN and LEAVE commands (prefix + slash)
 # ----------------------------
-async def send_now_playing(player: wavelink.Player, requester):
-    tr = getattr(player, "current", None)
-    if not tr:
+@bot.command(name="join")
+async def cmd_join(ctx):
+    """Prefix: ?join"""
+    # use connect_player_for to create wavelink.Player properly
+    player = await connect_player_for(ctx)
+    if not player:
         return
-    title = getattr(tr, "title", "Unknown")
-    url = getattr(tr, "uri", None)
-    thumb = getattr(tr, "thumb", None)
-    author = getattr(tr, "author", "Unknown")
-    length_ms = getattr(tr, "length", 0) or 0
-    minutes = (length_ms // 60000)
-    seconds = (length_ms // 1000) % 60
-    qlen = len(player.queue._queue) if getattr(player, "queue", None) else 0
-    embed = discord.Embed(title="▶️ STARTED PLAYING", description=f"[{title}]({url})" if url else title, color=discord.Color.blue())
-    embed.add_field(name="Artist", value=author, inline=True)
-    embed.add_field(name="Duration", value=f"{minutes:02d}:{seconds:02d}", inline=True)
-    embed.add_field(name="Queue", value=str(qlen), inline=True)
-    embed.add_field(name="Requested", value=(requester.mention if requester else "—"), inline=True)
-    if thumb:
-        embed.set_thumbnail(url=thumb)
-    view = MusicControls(player, requester_id=getattr(requester, "id", None))
-    ch = getattr(player, "text_channel", None)
-    if ch:
-        await ch.send(embed=embed, view=view)
+    await ctx.send(f"✅ Joined **{ctx.author.voice.channel}**")
+
+@bot.tree.command(name="join", description="Join the voice channel you are in")
+async def slash_join(interaction: discord.Interaction):
+    """Slash: /join"""
+    player = await connect_player_for(interaction)
+    if not player:
+        return
+    await interaction.response.send_message(f"✅ Joined **{interaction.user.voice.channel}**", ephemeral=False)
+
+@bot.command(name="leave")
+async def cmd_leave(ctx):
+    """Prefix: ?leave"""
+    player = ctx.voice_client
+    if not player:
+        await ctx.send("❌ Not connected.")
+        return
+    # cancel disconnect tasks
+    try:
+        if getattr(player, "_disconnect_task", None):
+            player._disconnect_task.cancel()
+    except Exception:
+        pass
+    try:
+        await player.disconnect()
+        await ctx.send("⏹️ Disconnected.")
+    except Exception:
+        await ctx.send("⚠️ Failed to disconnect.")
+
+@bot.tree.command(name="leave", description="Disconnect the bot from voice")
+async def slash_leave(interaction: discord.Interaction):
+    player = interaction.guild.voice_client
+    if not player:
+        await interaction.response.send_message("❌ Not connected.", ephemeral=True)
+        return
+    try:
+        if getattr(player, "_disconnect_task", None):
+            player._disconnect_task.cancel()
+    except Exception:
+        pass
+    try:
+        await player.disconnect()
+        await interaction.response.send_message("⏹️ Disconnected.", ephemeral=False)
+    except Exception:
+        await interaction.response.send_message("⚠️ Failed to disconnect.", ephemeral=True)
 
 # ----------------------------
-# Basic prefix controls
+# Other prefix commands
 # ----------------------------
 @bot.command(name="skip")
 async def cmd_skip(ctx):
@@ -559,13 +576,9 @@ async def cmd_volume(ctx, vol: int):
 # ----------------------------
 # 24/7 toggle (prefix & slash)
 # ----------------------------
-def guild_has_manage_perms(member: discord.Member):
-    return member.guild_permissions.manage_guild or member.guild_permissions.administrator or member == member.guild.owner
-
 @bot.command(name="set247")
 @commands.has_guild_permissions(manage_guild=True)
 async def cmd_set247(ctx, mode: str):
-    # usage: ?set247 on / ?set247 off
     mode = mode.lower().strip()
     ensure_guild_settings(ctx.guild.id)
     if mode in ("on", "true", "1", "enable", "enabled"):
@@ -582,7 +595,6 @@ async def cmd_set247(ctx, mode: str):
 @bot.tree.command(name="set_247", description="Enable or disable 24/7 mode for this guild (requires Manage Server).")
 @discord.app_commands.describe(enabled="Enable (true) or disable (false) 24/7 mode")
 async def slash_set_247(interaction: discord.Interaction, enabled: bool):
-    # check perms
     member = interaction.user
     if not (member.guild_permissions.manage_guild or member.guild_permissions.administrator or member == member.guild.owner):
         await interaction.response.send_message("❌ You need Manage Server or Administrator to change this.", ephemeral=True)
@@ -633,38 +645,56 @@ async def cmd_earape(ctx, seconds: int = EARRAPE_DEFAULT_SECONDS):
     await ctx.send(warn, view=view)
 
 # ----------------------------
+# send Now Playing embed + controls
+# ----------------------------
+async def send_now_playing(player: wavelink.Player, requester):
+    tr = getattr(player, "current", None)
+    if not tr:
+        return
+    title = getattr(tr, "title", "Unknown")
+    url = getattr(tr, "uri", None)
+    thumb = getattr(tr, "thumb", None)
+    author = getattr(tr, "author", "Unknown")
+    length_ms = getattr(tr, "length", 0) or 0
+    minutes = (length_ms // 60000)
+    seconds = (length_ms // 1000) % 60
+    qlen = len(player.queue._queue) if getattr(player, "queue", None) else 0
+    embed = discord.Embed(title="▶️ STARTED PLAYING", description=f"[{title}]({url})" if url else title, color=discord.Color.blue())
+    embed.add_field(name="Artist", value=author, inline=True)
+    embed.add_field(name="Duration", value=f"{minutes:02d}:{seconds:02d}", inline=True)
+    embed.add_field(name="Queue", value=str(qlen), inline=True)
+    embed.add_field(name="Requested", value=(requester.mention if requester else "—"), inline=True)
+    if thumb:
+        embed.set_thumbnail(url=thumb)
+    view = MusicControls(player, requester_id=getattr(requester, "id", None))
+    ch = getattr(player, "text_channel", None)
+    if ch:
+        await ch.send(embed=embed, view=view)
+
+# ----------------------------
 # Wavelink track end event: play next or handle idle/disconnect
 # ----------------------------
 @bot.event
 async def on_wavelink_track_end(player: wavelink.Player, track, reason):
-    # loop current
     if getattr(player, "loop", False):
         try:
             await player.play(track)
             return
         except Exception:
             pass
-    # play next
     if not player.queue.is_empty:
         nxt = player.queue.get()
         await player.play(nxt)
-        # send now playing to text channel
         try:
-            await send_now_playing(player, getattr(player, "current_requester", None) or getattr(player, "text_channel", None))
+            if getattr(player, "text_channel", None):
+                # try sending now playing embed
+                await send_now_playing(player, getattr(player, "current_requester", None) or player.text_channel)
         except Exception:
-            # fallback: if player.text_channel exists, send; else skip
-            try:
-                if getattr(player, "text_channel", None):
-                    await send_now_playing(player, player.text_channel)
-            except Exception:
-                pass
+            pass
     else:
-        # if 24/7 enabled -> stay connected
         gid = player.guild.id
         if is_247_enabled(gid):
-            # do nothing; remain connected
             return
-        # schedule auto-disconnect in 120s
         await schedule_auto_disconnect(player, guild_id=gid, delay=120)
 
 # ----------------------------
