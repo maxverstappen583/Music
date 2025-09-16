@@ -1,16 +1,21 @@
+FROM eclipse-temurin:17-jre AS lavalink
+WORKDIR /app
+COPY Lavalink.jar .
+COPY application.yml .
+
 FROM python:3.11-slim
-
-# Install dependencies
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
-
-# Set working directory
 WORKDIR /app
 
-# Copy files
-COPY . .
-
-# Install requirements
+# Copy bot files
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Run bot
-CMD ["python", "bot.py"]
+COPY bot.py .
+COPY --from=lavalink /app/Lavalink.jar .
+COPY --from=lavalink /app/application.yml .
+
+# Expose Lavalink port
+EXPOSE 2333
+
+# Run Lavalink + bot together
+CMD java -jar Lavalink.jar & python bot.py
