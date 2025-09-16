@@ -3,7 +3,7 @@ server:
 
 lavalink:
   server:
-    password: "maxverstappentututu
+    password: "youshallnotpass"
     sources:
       youtube: true
       bandcamp: true
