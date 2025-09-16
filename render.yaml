@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: lavalink
+    env: docker
+    dockerfilePath: ./lavalink/Dockerfile
+    buildCommand: ""
+    startCommand: ""
+    autoDeploy: true
+  - type: web
+    name: discord-music-bot
+    env: docker
+    dockerfilePath: ./bot/Dockerfile
+    buildCommand: ""
+    startCommand: ""
+    autoDeploy: true
