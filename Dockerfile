@@ -1,38 +1,29 @@
-# Dockerfile (Render-ready) - starts Lavalink then bot via start.sh
+# bot/Dockerfile
 FROM python:3.11-bullseye
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /app
 
-# Install system dependencies (ffmpeg, java, libsodium dev, build tools)
-RUN apt-get update && apt-get upgrade -y \
-    && apt-get install -y --no-install-recommends \
-       ffmpeg \
-       openjdk-17-jre-headless \
-       libsodium-dev \
-       build-essential \
-       python3-dev \
-       curl \
-       ca-certificates \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+# System deps for PyNaCl build and ffmpeg for audio
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libsodium-dev \
+    build-essential \
+    python3-dev \
+    curl \
+    ca-certificates \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install python deps
+# Copy requirements and install
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy project files
+# Copy bot files
 COPY . .
 
-# Download Lavalink.jar (official releases use this path)
-RUN curl -L -o Lavalink.jar https://github.com/lavalink-devs/Lavalink/releases/latest/download/Lavalink.jar || true
+# Expose Flask port so Render health checks succeed
+EXPOSE 8080
 
-# Ensure start script is executable
-RUN chmod +x ./start.sh
-
-# Expose ports
-EXPOSE 2333 8080
-
-# Start Lavalink (background) and then the bot (start.sh handles waiting)
-CMD ["./start.sh"]
+# Start the bot
+CMD ["python", "musicbot_247_flask.py"]
