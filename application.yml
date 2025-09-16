@@ -1,5 +1,6 @@
 server:
   port: 2333
+  address: 0.0.0.0
 
 lavalink:
   server:
@@ -11,7 +12,8 @@ lavalink:
       twitch: true
       vimeo: true
       http: true
-      local: true
+      local: false
     bufferDurationMs: 400
-    frameBufferDurationMs: 5000
+    frameBufferDurationMs: 1000
+    trackStuckThresholdMs: 10000
     gc-warnings: true
