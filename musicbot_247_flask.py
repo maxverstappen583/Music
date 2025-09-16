@@ -1,26 +1,26 @@
 # musicbot_247_flask.py
-# Full-featured music bot + diagnostics for join/connect issues.
-# Make sure DISCORD_TOKEN and other env vars are set before running.
+# Updated for Render: waits for Lavalink, clearer diagnostics, supports HTTPS Lavalink endpoints.
 
 import os
+import asyncio
+import json
+import random
+import threading
 import discord
 from discord.ext import commands
 import wavelink
-import asyncio
-import random
-import json
-import threading
 import lyricsgenius
 from flask import Flask, jsonify
 
-# ----------------------------
+# -------------------------
 # Configuration (env)
-# ----------------------------
+# -------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
-GENIUS_TOKEN = os.getenv("GENIUS_TOKEN") or os.getenv("GENIUS_API_TOKEN", "")
-LAVALINK_HOST = os.getenv("LAVALINK_HOST", "localhost")
-LAVALINK_PORT = int(os.getenv("LAVALINK_PORT", "2333"))
+GENIUS_TOKEN = os.getenv("GENIUS_TOKEN", "")  # optional
+LAVALINK_HOST = os.getenv("LAVALINK_HOST", "localhost")  # set to your Lavalink service host (no protocol)
+LAVALINK_PORT = int(os.getenv("LAVALINK_PORT", "2333"))  # on Render, set to 443 if using HTTPS
 LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", os.getenv("LAVALINK_PASS", "youshallnotpass"))
+LAVALINK_SECURE = os.getenv("LAVALINK_SECURE", "true").lower() in ("1", "true", "yes")
 PREFIX = os.getenv("BOT_PREFIX", "?")
 FLASK_PORT = int(os.getenv("FLASK_PORT", os.getenv("PORT", "8080")))
 
@@ -30,9 +30,9 @@ EARRAPE_VOLUME = 400
 
 SETTINGS_FILE = "settings.json"
 
-# ----------------------------
-# Intents & bot init
-# ----------------------------
+# -------------------------
+# Bot init
+# -------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
@@ -40,9 +40,9 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 genius = lyricsgenius.Genius(GENIUS_TOKEN) if GENIUS_TOKEN else None
 
-# ----------------------------
-# Persistent settings helpers
-# ----------------------------
+# -------------------------
+# Settings persistence
+# -------------------------
 def load_settings():
     if not os.path.exists(SETTINGS_FILE):
         return {"guilds": {}}
@@ -71,26 +71,27 @@ def is_247_enabled(guild_id):
     gid = str(guild_id)
     return settings.get("guilds", {}).get(gid, {}).get("247", False)
 
-# ----------------------------
-# Flask keepalive (for Render)
-# ----------------------------
+# -------------------------
+# Flask keepalive
+# -------------------------
 flask_app = Flask("musicbot_keepalive")
 
 @flask_app.route("/", methods=["GET"])
 def index():
-    return jsonify({"status": "ok", "bot": str(bot.user) if bot.is_ready() else "starting"}), 200
+    return jsonify({"status":"ok","bot": str(bot.user) if bot.is_ready() else "starting"}), 200
 
 def run_flask():
     flask_app.run(host="0.0.0.0", port=FLASK_PORT)
 
-# ----------------------------
-# Utility: message sending (Context or Interaction)
-# ----------------------------
+# -------------------------
+# Utility: safe send
+# -------------------------
 async def safe_send(dest, content=None, embed=None, view=None, ephemeral=False):
     try:
         if isinstance(dest, commands.Context):
             return await dest.send(content=content, embed=embed, view=view)
         else:
+            # Interaction
             if ephemeral:
                 return await dest.response.send_message(content=content, embed=embed, view=view, ephemeral=True)
             else:
@@ -107,34 +108,30 @@ async def safe_send(dest, content=None, embed=None, view=None, ephemeral=False):
         except Exception:
             pass
 
-# ----------------------------
-# On ready -> connect to Lavalink node and report PyNaCl presence
-# ----------------------------
+# -------------------------
+# Lavalink connect: on_ready
+# -------------------------
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
 
-    # report PyNaCl availability (voice needs this)
+    # Report if PyNaCl is present
     try:
         import nacl
-        print("PyNaCl imported OK.")
+        print("PyNaCl available.")
     except Exception as e:
-        print("WARNING: PyNaCl not available or failed to import:", e)
+        print("PyNaCl import failed - voice features may not work. Error:", e)
 
-    # Try to create/attach a Lavalink node
+    # Attempt to create a node; we will not crash if it fails (bot still runs)
     if not wavelink.NodePool.nodes:
         try:
-            await wavelink.NodePool.create_node(
-                bot=bot,
-                host=LAVALINK_HOST,
-                port=LAVALINK_PORT,
-                password=LAVALINK_PASSWORD,
-                https=False,
-            )
-            print(f"✅ Connected to Lavalink at {LAVALINK_HOST}:{LAVALINK_PORT}")
+            print(f"Attempting to create Lavalink node -> host={LAVALINK_HOST} port={LAVALINK_PORT} https={LAVALINK_SECURE}")
+            await wavelink.NodePool.create_node(bot=bot, host=LAVALINK_HOST, port=LAVALINK_PORT, password=LAVALINK_PASSWORD, https=LAVALINK_SECURE)
+            print("✅ Lavalink node created")
         except Exception as e:
-            print("❌ Could not connect to Lavalink node:", e)
-            print("If Lavalink is running in the same container, ensure it finished booting before the bot connects.")
+            print("⚠️ Failed to create Lavalink node at startup:", e)
+            # don't raise; we will wait for node on connect attempts
+
     # sync slash commands
     try:
         synced = await bot.tree.sync()
@@ -142,10 +139,19 @@ async def on_ready():
     except Exception as e:
         print("⚠️ Slash sync failed:", e)
 
-# ----------------------------
-# Connect player helper (tries to connect with wavelink.Player)
-# and provides helpful error messages
-# ----------------------------
+# -------------------------
+# Helper: wait for Lavalink node to exist (used before connecting)
+# -------------------------
+async def wait_for_lavalink_node(timeout: int = 30):
+    for i in range(timeout):
+        if wavelink.NodePool.nodes:
+            return True
+        await asyncio.sleep(1)
+    return False
+
+# -------------------------
+# Connect player helper (waits for Lavalink node; fallback diagnostic)
+# -------------------------
 async def connect_player_for(ctx_or_inter):
     user = ctx_or_inter.author if isinstance(ctx_or_inter, commands.Context) else ctx_or_inter.user
     if not user or not getattr(user, "voice", None) or not getattr(user.voice, "channel", None):
@@ -156,14 +162,33 @@ async def connect_player_for(ctx_or_inter):
     guild = ctx_or_inter.guild
     player = guild.voice_client
 
+    # If node not available, wait a bit (Render may boot Lavalink slightly later)
+    if not wavelink.NodePool.nodes:
+        ok = await wait_for_lavalink_node(timeout=20)
+        if not ok:
+            # Inform user and attempt fallback connect
+            await safe_send(ctx_or_inter, ("❌ Lavalink node is not available (bot waited ~20s). "
+                                           "Playback requires Lavalink. Attempting a normal Discord connect as fallback (playback may not work)."), ephemeral=isinstance(ctx_or_inter, discord.Interaction))
+            # Try fallback discord.py VoiceClient connect to at least join
+            try:
+                if guild.voice_client:
+                    await guild.voice_client.move_to(channel)
+                    return guild.voice_client
+                else:
+                    vc = await channel.connect()
+                    return vc
+            except Exception as e:
+                await safe_send(ctx_or_inter, f"❌ Failed to join VC (fallback failed): `{e}`", ephemeral=isinstance(ctx_or_inter, discord.Interaction))
+                return None
+
+    # If already connected, return existing player/voice client
     if player:
-        # already connected, return it
         return player
 
-    # Attempt to connect using wavelink.Player (requires Lavalink up)
+    # Now attempt wavelink.Player connect (requires node)
     try:
         player = await channel.connect(cls=wavelink.Player)
-        # set helpful attributes
+        # add attributes used by bot
         player.queue = wavelink.Queue()
         player.loop = False
         player.custom_volume = getattr(player, "custom_volume", 100)
@@ -172,57 +197,24 @@ async def connect_player_for(ctx_or_inter):
         player._earrape_prev_volume = getattr(player, "custom_volume", 100)
         return player
     except Exception as e:
-        # Provide detailed feedback to user and logs
-        msg = f"❌ Failed to join voice channel using wavelink.Player: `{e}`\n"
-        msg += "Possible causes:\n"
-        msg += "- Lavalink is not running or not reachable (check logs / start script).\n"
-        msg += "- Missing system libs (ffmpeg / PyNaCl).\n"
-        msg += "I will attempt a standard Discord voice connect as a fallback (playback may not work until Lavalink is available)."
-        print("Join error (wavelink connect):", e)
-        await safe_send(ctx_or_inter, msg, ephemeral=isinstance(ctx_or_inter, discord.Interaction))
-
-        # Fallback: try normal discord.py connect so the bot at least joins
+        print("Error connecting with wavelink.Player:", e)
+        await safe_send(ctx_or_inter, f"❌ Failed to join voice channel using wavelink.Player: `{e}`\nPossible causes: Lavalink unavailable or invalid node config. Falling back to discord.VoiceClient (may not support playback).", ephemeral=isinstance(ctx_or_inter, discord.Interaction))
+        # fallback attempt
         try:
-            discord_vc = await channel.connect()
-            print("Fallback: connected with discord.VoiceClient (playback via Lavalink will require Lavalink).")
-            # Note: this VoiceClient won't support wavelink playback until replaced by a wavelink.Player.
-            return discord_vc
+            if guild.voice_client:
+                await guild.voice_client.move_to(channel)
+                return guild.voice_client
+            else:
+                vc = await channel.connect()
+                return vc
         except Exception as e2:
             print("Fallback discord connect failed:", e2)
             await safe_send(ctx_or_inter, f"❌ Failed to join VC (fallback also failed): `{e2}`", ephemeral=isinstance(ctx_or_inter, discord.Interaction))
             return None
 
-# ----------------------------
-# Auto-disconnect scheduler (2 minutes if 24/7 disabled)
-# ----------------------------
-async def schedule_auto_disconnect(player: wavelink.Player, guild_id: int, delay: int = 120):
-    try:
-        if getattr(player, "_disconnect_task", None):
-            player._disconnect_task.cancel()
-    except Exception:
-        pass
-
-    async def _task():
-        try:
-            await asyncio.sleep(delay)
-            if player.is_playing() or not player.is_connected():
-                return
-            if is_247_enabled(guild_id):
-                return
-            if getattr(player, "queue", None) and not player.queue.is_empty:
-                return
-            try:
-                await player.disconnect()
-            except Exception:
-                pass
-        except asyncio.CancelledError:
-            return
-
-    player._disconnect_task = asyncio.create_task(_task())
-
-# ----------------------------
-# Simple Join/Leave (prefix & slash) with diagnostic output
-# ----------------------------
+# -------------------------
+# Basic commands: join / leave (prefix + slash)
+# -------------------------
 @bot.command(name="join")
 async def cmd_join(ctx):
     player = await connect_player_for(ctx)
@@ -230,7 +222,7 @@ async def cmd_join(ctx):
         return
     await ctx.send(f"✅ Joined **{ctx.author.voice.channel}**")
 
-@bot.tree.command(name="join", description="Join your voice channel")
+@bot.tree.command(name="join", description="Join your current VC")
 async def slash_join(interaction: discord.Interaction):
     player = await connect_player_for(interaction)
     if not player:
@@ -271,35 +263,32 @@ async def slash_leave(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message(f"⚠️ Failed to disconnect: `{e}`", ephemeral=True)
 
-# ----------------------------
-# Minimal play that shows errors clearly (prefix + slash)
-# Only YouTube supported (no Spotify)
-# ----------------------------
+# -------------------------
+# Minimal play (prefix + slash) with clear error messages
+# Only YouTube supported (yt-dlp + Lavalink)
+# -------------------------
 @bot.command(name="play")
 async def cmd_play(ctx, *, query: str):
     player = await connect_player_for(ctx)
     if not player:
         return
-    is_url = query.startswith("http") or "youtube.com" in query or "youtu.be" in query
+    is_url = query.startswith("http") or "youtube" in query or "youtu.be" in query
     try:
         if is_url:
             tracks = await wavelink.YouTubeTrack.search(query=query)
         else:
             tracks = await wavelink.YouTubeTrack.search(query=f"ytsearch:{query}")
     except Exception as e:
-        await ctx.send(f"⚠️ Search error: `{e}` — make sure Lavalink is running and reachable.")
+        await ctx.send(f"⚠️ Search error: `{e}` — ensure Lavalink is running and node config is correct.")
         print("Search error:", e)
         return
-
     if not tracks:
         await ctx.send("❌ No results found.")
         return
-
-    # If this player is a discord.VoiceClient fallback (not wavelink.Player) - warn user
+    # if not wavelink.Player (fallback), warn user playback may not work
     if not isinstance(player, wavelink.Player):
-        await ctx.send("⚠️ Playback requires Lavalink/wavelink. Bot connected via fallback; playback may not work until Lavalink is available.")
+        await ctx.send("⚠️ Connected via fallback voice client; playback requires Lavalink/wavelink. Wait for Lavalink.")
         return
-
     added = 0
     for tr in (tracks if isinstance(tr, list) else [tracks]):
         try:
@@ -308,13 +297,12 @@ async def cmd_play(ctx, *, query: str):
             pass
         await player.queue.put_wait(tr)
         added += 1
-
     await ctx.send(f"✅ Added {added} track(s) to queue.")
     if not player.is_playing():
         await player.play(player.queue.get())
         await send_now_playing(player, ctx.author)
 
-@bot.tree.command(name="play", description="Play from a YouTube link or playlist")
+@bot.tree.command(name="play", description="Play from a YouTube link (provide link or playlist)")
 @discord.app_commands.describe(url="YouTube link or playlist")
 async def slash_play(interaction: discord.Interaction, url: str):
     player = await connect_player_for(interaction)
@@ -326,15 +314,12 @@ async def slash_play(interaction: discord.Interaction, url: str):
         await interaction.response.send_message(f"⚠️ Search error: `{e}`", ephemeral=True)
         print("Search error (slash):", e)
         return
-
     if not tracks:
         await interaction.response.send_message("❌ No results found.", ephemeral=True)
         return
-
     if not isinstance(player, wavelink.Player):
-        await interaction.response.send_message("⚠️ Playback requires Lavalink/wavelink. Bot connected via fallback; playback may not work until Lavalink is available.", ephemeral=True)
+        await interaction.response.send_message("⚠️ Connected via fallback voice client; playback requires Lavalink/wavelink. Wait for Lavalink.", ephemeral=True)
         return
-
     added = 0
     for tr in (tracks if isinstance(tr, list) else [tracks]):
         try:
@@ -343,16 +328,14 @@ async def slash_play(interaction: discord.Interaction, url: str):
             pass
         await player.queue.put_wait(tr)
         added += 1
-
     await interaction.response.send_message(f"✅ Added {added} track(s) to queue.")
     if not player.is_playing():
         await player.play(player.queue.get())
         await send_now_playing(player, interaction.user)
 
-# ----------------------------
-# Controls: skip/pause/resume/stop/np/queue/volume (prefix only)
-# (similar to earlier — left concise)
-# ----------------------------
+# -------------------------
+# Controls (basic): skip, pause, resume, stop, np, queue, volume (prefix only)
+# -------------------------
 @bot.command(name="skip")
 async def cmd_skip(ctx):
     player = ctx.voice_client
@@ -419,9 +402,9 @@ async def cmd_volume(ctx, vol: int):
     except Exception as e:
         await ctx.send(f"⚠️ Could not set volume: `{e}`")
 
-# ----------------------------
-# Minimal now playing sender (no fancy controls here for brevity)
-# ----------------------------
+# -------------------------
+# Now playing (simple embed)
+# -------------------------
 async def send_now_playing(player: wavelink.Player, requester):
     tr = getattr(player, "current", None)
     if not tr:
@@ -445,9 +428,9 @@ async def send_now_playing(player: wavelink.Player, requester):
     if ch:
         await ch.send(embed=embed)
 
-# ----------------------------
-# Track end: play next or schedule disconnect
-# ----------------------------
+# -------------------------
+# Track end handler
+# -------------------------
 @bot.event
 async def on_wavelink_track_end(player: wavelink.Player, track, reason):
     if getattr(player, "loop", False):
@@ -469,9 +452,37 @@ async def on_wavelink_track_end(player: wavelink.Player, track, reason):
             return
         await schedule_auto_disconnect(player, guild_id=gid, delay=120)
 
-# ----------------------------
+# -------------------------
+# Auto-disconnect scheduler
+# -------------------------
+async def schedule_auto_disconnect(player: wavelink.Player, guild_id: int, delay: int = 120):
+    try:
+        if getattr(player, "_disconnect_task", None):
+            player._disconnect_task.cancel()
+    except Exception:
+        pass
+
+    async def _task():
+        try:
+            await asyncio.sleep(delay)
+            if player.is_playing() or not player.is_connected():
+                return
+            if is_247_enabled(guild_id):
+                return
+            if getattr(player, "queue", None) and not player.queue.is_empty:
+                return
+            try:
+                await player.disconnect()
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            return
+
+    player._disconnect_task = asyncio.create_task(_task())
+
+# -------------------------
 # Start keepalive & run
-# ----------------------------
+# -------------------------
 def start_keepalive():
     thr = threading.Thread(target=run_flask, daemon=True)
     thr.start()
@@ -479,7 +490,7 @@ def start_keepalive():
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        print("Please set DISCORD_TOKEN environment variable.")
+        print("Please set DISCORD_TOKEN environment variable and restart.")
     else:
         start_keepalive()
         bot.run(DISCORD_TOKEN)
