@@ -1,21 +1,38 @@
-FROM eclipse-temurin:17-jre AS lavalink
-WORKDIR /app
-COPY Lavalink.jar .
-COPY application.yml .
+# Dockerfile (Render-ready) - starts Lavalink then bot via start.sh
+FROM python:3.11-bullseye
 
-FROM python:3.11-slim
+ENV DEBIAN_FRONTEND=noninteractive
+
 WORKDIR /app
 
-# Copy bot files
+# Install system dependencies (ffmpeg, java, libsodium dev, build tools)
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
+       ffmpeg \
+       openjdk-17-jre-headless \
+       libsodium-dev \
+       build-essential \
+       python3-dev \
+       curl \
+       ca-certificates \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py .
-COPY --from=lavalink /app/Lavalink.jar .
-COPY --from=lavalink /app/application.yml .
+# Copy project files
+COPY . .
 
-# Expose Lavalink port
-EXPOSE 2333
+# Download Lavalink.jar (official releases use this path)
+RUN curl -L -o Lavalink.jar https://github.com/lavalink-devs/Lavalink/releases/latest/download/Lavalink.jar || true
 
-# Run Lavalink + bot together
-CMD java -jar Lavalink.jar & python bot.py
+# Ensure start script is executable
+RUN chmod +x ./start.sh
+
+# Expose ports
+EXPOSE 2333 8080
+
+# Start Lavalink (background) and then the bot (start.sh handles waiting)
+CMD ["./start.sh"]
