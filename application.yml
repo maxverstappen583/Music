@@ -5,15 +5,13 @@ server:
 lavalink:
   server:
     password: "youshallnotpass"
-    sources:
-      youtube: true
-      bandcamp: true
-      soundcloud: true
-      twitch: true
-      vimeo: true
-      http: true
-      local: false
-    bufferDurationMs: 400
-    frameBufferDurationMs: 1000
-    trackStuckThresholdMs: 10000
-    gc-warnings: true
+
+plugins:
+  youtube:
+    enabled: true
+  spotify:
+    clientId: ""
+    clientSecret: ""
+    enabled: true
+  soundcloud:
+    enabled: true
