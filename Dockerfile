@@ -1,29 +1,16 @@
-# bot/Dockerfile
-FROM python:3.11-bullseye
+FROM python:3.11-slim
 
-ENV DEBIAN_FRONTEND=noninteractive
+# Install dependencies
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
+# Set working directory
 WORKDIR /app
 
-# System deps for PyNaCl build and ffmpeg for audio
-RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    libsodium-dev \
-    build-essential \
-    python3-dev \
-    curl \
-    ca-certificates \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements and install
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy bot files
+# Copy files
 COPY . .
 
-# Expose Flask port so Render health checks succeed
-EXPOSE 8080
+# Install requirements
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Start the bot
-CMD ["python", "musicbot_247_flask.py"]
+# Run bot
+CMD ["python", "bot.py"]
